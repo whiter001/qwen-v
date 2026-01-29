@@ -1,5 +1,21 @@
-**/*
-!.gitignore
-!**/*.v
-!**/*.md
-!**/*.vsh
+# Binaries
+qwen_agent
+qwen_agent.exe
+*.exe
+*.o
+*.obj
+
+# V specific
+v_tmp/
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# MCP settings (exclude secrets)
+oauth_creds.json
+
+# Node modules
+node_modules/
+test_tools
