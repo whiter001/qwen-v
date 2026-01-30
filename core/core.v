@@ -151,9 +151,10 @@ pub fn glob_files(pattern string) []string {
 
 pub struct MCPServerConfig {
 pub:
-	command string            @[json: 'command']
-	args    []string          @[json: 'args']
-	env     map[string]string @[json: 'env']
+	command string            @[json: 'command'; optional]
+	args    []string          @[json: 'args'; optional]
+	env     map[string]string @[json: 'env'; optional]
+	url     string            @[json: 'url'; optional]
 }
 
 pub struct QwenSettings {
@@ -283,10 +284,17 @@ pub fn (mut c McpClient) request(method string, params_json string) !string {
 	c.process.stdin_write(payload + '\n')
 
 	mut response_buffer := ''
+	start_time := time.ticks()
+	timeout_ms := 5000 // 5秒超时
+	
 	for {
+		if time.ticks() - start_time > timeout_ms {
+			return error('MCP 请求超时 (${method})')
+		}
+
 		out_chunk := c.process.stdout_read()
 		if out_chunk == '' {
-			time.sleep(100 * time.millisecond)
+			time.sleep(50 * time.millisecond)
 			continue
 		}
 
@@ -489,39 +497,112 @@ pub fn get_available_tools() []Tool {
 
 pub struct QwenAgent {
 pub mut:
-	creds       QwenCredentials
-	endpoint    string
-	model       string
-	history     []ChatMessage
-	mcp_clients map[string]&McpClient
-	extra_tools []Tool
-	debug       bool
+	creds        QwenCredentials
+	endpoint     string
+	model        string
+	history      []ChatMessage
+	mcp_clients  map[string]&McpClient
+	extra_tools  []Tool
+	settings     QwenSettings
+	debug        bool
+	status_text  string
+	is_plan_mode bool
 }
 
 pub fn new_qwen_agent() !&QwenAgent {
 	creds := load_qwen_creds()!
+	settings := load_qwen_settings() or { QwenSettings{} }
 	model := 'coder-model'
 	mut base_url := if creds.resource_url != '' { creds.resource_url } else { 'dashscope.aliyuncs.com/compatible-mode' }
 	if !base_url.starts_with('http') { base_url = 'https://' + base_url }
 	if !base_url.ends_with('/v1') { base_url = base_url.trim_right('/') + '/v1' }
 
-	return &QwenAgent{
+	mut agent := &QwenAgent{
 		creds: creds
 		endpoint: base_url + '/chat/completions'
 		model: model
-		history: [
-			ChatMessage{
-				role: 'system'
-				content: 'You are Qwen-V Agent, a powerful coding assistant with tool use capabilities. Current OS: ' + os.user_os()
-			}
-		]
+		history: [] // 稍后延迟初始化 history
 		mcp_clients: map[string]&McpClient{}
 		extra_tools: []Tool{}
+		settings: settings
 		debug: false
+	}
+	
+	agent.init_mcp_tools()
+	return agent
+}
+
+pub fn (mut a QwenAgent) init_history() {
+	mut sys_prompt := 'You are Qwen-V Agent, a powerful coding assistant with tool use capabilities. Current OS: ' + os.user_os()
+	if a.is_plan_mode {
+		sys_prompt += '\nIMPORTANT: You are currently in PLAN MODE. You can read files and explore codebases, but you CANNOT modify files or run commands that change the system. Your goal is to analyze and plan.'
+	}
+	a.history = [
+		ChatMessage{
+			role: 'system'
+			content: sys_prompt
+		}
+	]
+}
+
+pub fn (mut a QwenAgent) init_mcp_tools() {
+	for name, config in a.settings.mcp_servers {
+		if name == 'playwright' { continue } 
+		if config.command == '' {
+			if a.debug { eprint('Skipping non-stdio MCP Server: ${name}\n') }
+			continue
+		}
+		
+		if a.debug { eprint('Initializing MCP Server: ${name}\n') }
+		mut client := &McpClient{ debug: a.debug }
+		client.connect(config.command, config.args, config.env) or {
+			if a.debug { eprint('Failed to connect to ${name}: ${err}\n') }
+			continue
+		}
+		a.mcp_clients[name] = client
+		
+		// 尝试获取工具列表
+		tools_json := client.request('tools/list', '{}') or { continue }
+		resp := json.decode(JsonRpcResponse, tools_json) or { continue }
+		tools_res := json.decode(ListToolsResult, resp.result) or { continue }
+		
+		for mcp_tool in tools_res.tools {
+			// 将 MCP 工具转换为 OpenAI 格式
+			// 注意：这里需要更复杂的参数转换，目前简单处理
+			a.extra_tools << Tool{
+				function: FunctionDeclaration{
+					name: '${name}__${mcp_tool.name}'
+					description: mcp_tool.description
+					parameters: Schema{
+						type_: 'object'
+						properties: map[string]Property{} // 简单化处理
+						required: []string{}
+					}
+				}
+			}
+		}
 	}
 }
 
 pub fn (mut a QwenAgent) execute_tool(name string, args map[string]string) string {
+	// Plan 模式逻辑：拦截写操作和执行操作
+	if a.is_plan_mode {
+		dangerous_tools := ['write_file', 'run_command', 'playwright_click', 'playwright_type', 'playwright_evaluate']
+		if name in dangerous_tools || name.contains('browser_click') || name.contains('browser_type') {
+			return "Error: [PLAN MODE] 拒绝执行修改类操作 '${name}'。请切换到普通模式或仅进行读取。"
+		}
+	}
+
+	if name.contains('__') {
+		parts := name.split('__')
+		server_name := parts[0]
+		tool_name := parts[1]
+		if mut client := a.mcp_clients[server_name] {
+			return client.call_tool(tool_name, args) or { 'Error: ${err}' }
+		}
+		return 'Error: MCP server ${server_name} not found'
+	}
+
 	match name {
 		'list_directory' {
 			path := normalize_path(args['path'] or { '.' })
@@ -553,8 +634,7 @@ pub fn (mut a QwenAgent) execute_tool(name string, args map[string]string) strin
 			return glob_files(pattern).join('\n')
 		}
 		'playwright_snapshot', 'playwright_click', 'playwright_type', 'playwright_navigate', 'playwright_back', 'playwright_evaluate' {
-			settings := load_qwen_settings() or { return 'Error: failed to load settings' }
-			pw_config := settings.mcp_servers['playwright'] or { return 'Error: playwright MCP not configured' }
+			pw_config := a.settings.mcp_servers['playwright'] or { return 'Error: playwright MCP not configured' }
 			
 			mut client := a.mcp_clients['playwright'] or {
 				mut c := &McpClient{ debug: a.debug }
@@ -584,11 +664,14 @@ pub fn (mut a QwenAgent) chat(text string) !string {
 	}
 	
 	for {
+		mut tools := get_available_tools()
+		tools << a.extra_tools
+
 		req_body := ChatRequest{
 			model: a.model
 			messages: a.history
 			stream: false
-			tools: get_available_tools()
+			tools: tools
 		}
 		
 		msg_data := json.encode(req_body)
@@ -615,6 +698,7 @@ pub fn (mut a QwenAgent) chat(text string) !string {
 			if tcs.len > 0 {
 				for tool_call in tcs {
 					tname := tool_call.function.name
+					a.status_text = "执行工具: ${tname}"
 					args := json.decode(map[string]string, tool_call.function.arguments) or { map[string]string{} }
 					result := a.execute_tool(tname, args)
 					
@@ -624,10 +708,12 @@ pub fn (mut a QwenAgent) chat(text string) !string {
 						content:      result
 					}
 				}
+				a.status_text = ""
 				continue
 			}
 		}
 		
+		a.status_text = ""
 		return if c := msg.content {
 			if c != '' { c } else { '执行完毕。' }
 		} else {

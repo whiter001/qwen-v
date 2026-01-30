@@ -12,6 +12,7 @@ fn main() {
 	mut prompt := ''
 	mut debug_mode := false
 	mut is_tui := false
+	mut is_plan := false
 	
 	for i := 0; i < args.len; i++ {
 		if args[i] == '-p' && i + 1 < args.len {
@@ -24,18 +25,33 @@ fn main() {
 		if args[i] == '--tui' {
 			is_tui = true
 		}
+		if args[i] == '--plan' {
+			is_plan = true
+		}
 	}
 
 	if !p_mode && !is_tui {
-		println(term.green('正在初始化支持工具的 Qwen Agent...'))
+		print(term.green('正在初始化 Qwen Agent... '))
+		os.flush()
 	}
 	
 	mut agent := core.new_qwen_agent() or {
+		println('')
 		eprintln(term.red('错误: ${err.msg()}'))
 		return
 	}
 	agent.debug = debug_mode
+	agent.is_plan_mode = is_plan
+	agent.init_history()
 	
+	if !p_mode && !is_tui {
+		println(term.green('完成！'))
+	}
+	
+	if is_plan {
+		println(term.yellow('! 计划模式已启动：所有修改操作（写文件、运行命令、点击网页）将被拦截。'))
+	}
+
 	if is_tui {
 		tui_agent.start_tui(agent)
 		return

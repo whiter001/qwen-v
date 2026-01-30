@@ -3,13 +3,34 @@ module tui_agent
 import term.ui as tui
 import core
 
+pub struct TuiLine {
+pub:
+	role  string
+	text  string
+	color tui.Color
+}
+
 pub struct TuiApp {
 pub mut:
 	ctx          &tui.Context = unsafe { nil }
 	input        []rune
 	agent        &core.QwenAgent = unsafe { nil }
 	is_loading   bool
+	current_tool string
 	scroll_y     int
+}
+
+fn word_wrap(text string, width int) []string {
+	if text.len <= width { return [text] }
+	mut lines := []string{}
+	mut start := 0
+	for start < text.len {
+		mut end := start + width
+		if end > text.len { end = text.len }
+		lines << text[start..end]
+		start = end
+	}
+	return lines
 }
 
 fn frame(x voidptr) {
@@ -19,7 +40,10 @@ fn frame(x voidptr) {
 
 	// 1. 标题
 	app.ctx.set_bg_color(r: 0, g: 80, b: 200)
-	title := " Qwen-V Agent TUI | Model: ${app.agent.model} "
+	mut title := " Qwen-V Agent | Model: ${app.agent.model} "
+	if app.agent.is_plan_mode {
+		title += "| [PLAN MODE] "
+	}
 	app.ctx.draw_text(1, 1, title + " ".repeat(if w > title.len { w - title.len } else { 0 }))
 	app.ctx.reset()
 
@@ -27,45 +51,44 @@ fn frame(x voidptr) {
 	mut current_row := 3
 	history_limit := h - 4
 	
-	mut start_msg := 0
-	if app.agent.history.len > 10 {
-		start_msg = app.agent.history.len - 10
-	}
-
-	for i := start_msg; i < app.agent.history.len; i++ {
+	// 计算需要显示的最后几条消息，并进行自动折行
+	mut display_lines := []TuiLine{}
+	
+	for i := 0; i < app.agent.history.len; i++ {
 		msg := app.agent.history[i]
 		if msg.role == "system" { continue }
-
-		if msg.role == "user" {
-			app.ctx.set_color(r: 0, g: 255, b: 0)
-		} else if msg.role == "tool" {
-			app.ctx.set_color(r: 100, g: 100, b: 255)
-		} else {
-			app.ctx.set_color(r: 0, g: 255, b: 255)
-		}
-
-		app.ctx.draw_text(1, current_row, "[${msg.role.to_upper()}]")
-		app.ctx.reset()
+		
+		color := if msg.role == "user" { tui.Color{r: 0, g: 255, b: 0} } 
+				else if msg.role == "tool" { tui.Color{r: 100, g: 100, b: 255} }
+				else { tui.Color{r: 0, g: 255, b: 255} }
 
 		raw_content := msg.content or { 
-			if msg.tool_calls != none { "调用工具中..." } else { "" } 
+			if msg.tool_calls != none { "Calling tools..." } else { "" } 
 		}
 		
-		txt_lines := raw_content.split_into_lines()
-		for line in txt_lines {
-			if current_row < history_limit {
-				display := if line.len > w - 4 { line[..w-4] } else { line }
-				app.ctx.draw_text(3, current_row + 1, display)
-				current_row++
-			}
+		wrapped := word_wrap(raw_content, w - 6)
+		for line_idx, line in wrapped {
+			display_lines << TuiLine{role: if line_idx == 0 { msg.role } else { "" }, text: line, color: color}
 		}
-		current_row += 2
+	}
+
+	start_idx := if display_lines.len > history_limit { display_lines.len - history_limit } else { 0 }
+	for i := start_idx; i < display_lines.len; i++ {
+		line := display_lines[i]
+		if line.role != "" {
+			app.ctx.set_color(line.color)
+			app.ctx.draw_text(1, current_row, "[${line.role.to_upper()}]")
+			app.ctx.reset()
+		}
+		app.ctx.draw_text(3, current_row, line.text)
+		current_row++
 	}
 
 	// 3. 状态提示
 	if app.is_loading {
 		app.ctx.set_color(r: 255, g: 255, b: 0)
-		app.ctx.draw_text(1, h - 2, "Qwen 正在执行计算/工具使用...")
+		status_text := if app.agent.status_text != "" { app.agent.status_text } else { "Qwen 正在思考中..." }
+		app.ctx.draw_text(1, h - 2, status_text)
 		app.ctx.reset()
 	}
 
