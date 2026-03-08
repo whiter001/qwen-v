@@ -15,7 +15,7 @@ fn main() {
 	mut is_plan := false
 	
 	for i := 0; i < args.len; i++ {
-		if args[i] == '-p' && i + 1 < args.len {
+		if (args[i] == '-p' || args[i] == '--prompt') && i + 1 < args.len {
 			p_mode = true
 			prompt = args[i + 1]
 		}

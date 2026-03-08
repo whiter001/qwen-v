@@ -1,0 +1,26 @@
+{
+  "model": {
+    "name": "coder-model"
+  },
+  "security": {
+    "auth": {
+      "selectedType": "qwen-oauth"
+    }
+  },
+  "$version": 3,
+  "mcpServers": {
+    "bun": {
+      "url": "https://bun.com/docs/mcp",
+      "headers": {}
+    },
+    "playwright": {
+      "type": "stdio",
+      "command": "/Users/byf/.local/bin/pnpm",
+      "args": ["dlx","@playwright/mcp", "--extension", "--browser", "chrome"],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/Users/byf/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "4HLQmp82gQWykHKiBGP72CNjqMMGIh7yZuCO65J4aCE"
+      }
+    }
+  }
+}
