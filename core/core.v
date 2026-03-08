@@ -117,6 +117,45 @@ pub fn normalize_path(path string) string {
 	return p
 }
 
+// --- 安全边界：路径验证 ---
+
+// 检查路径是否在工作区内
+pub fn is_path_in_workspace(workspace string, target_path string) bool {
+	if workspace == '' {
+		return true // 未设置工作区则不限制
+	}
+
+	// 获取绝对路径
+	abs_workspace := os.abs_path(workspace)
+	abs_target := os.abs_path(target_path)
+
+	// 检查目标路径是否以工作区路径开头
+	return abs_target.starts_with(abs_workspace)
+}
+
+// 验证并返回路径，如果不在工作区内则返回错误
+pub fn validate_workspace_path(workspace string, target_path string) !string {
+	if workspace == '' {
+		return normalize_path(target_path) // 未设置工作区则不限制
+	}
+
+	normalized := normalize_path(target_path)
+
+	// 处理相对路径
+	mut abs_target := normalized
+	if !normalized.starts_with('/') {
+		abs_target = os.abs_path(normalized)
+	} else {
+		abs_target = os.abs_path(normalized)
+	}
+
+	if !is_path_in_workspace(workspace, abs_target) {
+		return error('安全限制：路径 "${target_path}" 超出工作区 "${workspace}"')
+	}
+
+	return normalized
+}
+
 pub fn truncate_tool_output(s string, max_len int, tail_len int) string {
 	if s.len <= max_len {
 		return s
@@ -159,7 +198,8 @@ pub:
 
 pub struct QwenSettings {
 pub:
-	mcp_servers map[string]MCPServerConfig @[json: 'mcpServers']
+	mcp_servers            map[string]MCPServerConfig @[json: 'mcpServers']
+	restrict_to_workspace  bool                        @[json: 'restrictToWorkspace']
 }
 
 // --- MCP Client/Models ---
@@ -497,16 +537,17 @@ pub fn get_available_tools() []Tool {
 
 pub struct QwenAgent {
 pub mut:
-	creds        QwenCredentials
-	endpoint     string
-	model        string
-	history      []ChatMessage
-	mcp_clients  map[string]&McpClient
-	extra_tools  []Tool
-	settings     QwenSettings
-	debug        bool
-	status_text  string
-	is_plan_mode bool
+	creds                QwenCredentials
+	endpoint             string
+	model                string
+	history              []ChatMessage
+	mcp_clients          map[string]&McpClient
+	extra_tools          []Tool
+	settings             QwenSettings
+	debug                bool
+	status_text          string
+	is_plan_mode         bool
+	workspace            string // 工作区根目录，用于安全边界限制
 }
 
 pub fn new_qwen_agent() !&QwenAgent {
@@ -517,6 +558,9 @@ pub fn new_qwen_agent() !&QwenAgent {
 	if !base_url.starts_with('http') { base_url = 'https://' + base_url }
 	if !base_url.ends_with('/v1') { base_url = base_url.trim_right('/') + '/v1' }
 
+	// 获取工作区路径，默认为当前工作目录
+	workspace := os.getwd()
+
 	mut agent := &QwenAgent{
 		creds: creds
 		endpoint: base_url + '/chat/completions'
@@ -526,8 +570,9 @@ pub fn new_qwen_agent() !&QwenAgent {
 		extra_tools: []Tool{}
 		settings: settings
 		debug: false
+		workspace: workspace
 	}
-	
+
 	agent.init_mcp_tools()
 	return agent
 }
@@ -593,6 +638,10 @@ pub fn (mut a QwenAgent) execute_tool(name string, args map[string]string) strin
 		}
 	}
 
+	// 安全边界：工作区限制检查
+	restrict_workspace := a.settings.restrict_to_workspace
+	workspace_path := a.workspace
+
 	if name.contains('__') {
 		parts := name.split('__')
 		server_name := parts[0]
@@ -605,22 +654,69 @@ pub fn (mut a QwenAgent) execute_tool(name string, args map[string]string) strin
 
 	match name {
 		'list_directory' {
+			if restrict_workspace {
+				path := args['path'] or { '.' }
+				validated_path := validate_workspace_path(workspace_path, path) or { return 'Error: ${err}' }
+				normalized := normalize_path(validated_path)
+				items := os.ls(normalized) or { return 'Error: directory not found' }
+				return items.join('\n')
+			}
 			path := normalize_path(args['path'] or { '.' })
 			items := os.ls(path) or { return 'Error: directory not found' }
 			return items.join('\n')
 		}
 		'read_file' {
+			if restrict_workspace {
+				path := args['path'] or { '' }
+				validated_path := validate_workspace_path(workspace_path, path) or { return 'Error: ${err}' }
+				normalized := normalize_path(validated_path)
+				content := os.read_file(normalized) or { return 'Error: file not found' }
+				return truncate_tool_output(content, 16384, 512)
+			}
 			path := normalize_path(args['path'] or { '' })
 			content := os.read_file(path) or { return 'Error: file not found' }
 			return truncate_tool_output(content, 16384, 512)
 		}
 		'write_file' {
+			if restrict_workspace {
+				path := args['path'] or { '' }
+				validated_path := validate_workspace_path(workspace_path, path) or { return 'Error: ${err}' }
+				normalized := normalize_path(validated_path)
+				content := args['content'] or { '' }
+				os.write_file(normalized, content) or { return 'Error: write failed' }
+				return 'Done'
+			}
 			path := normalize_path(args['path'] or { '' })
 			content := args['content'] or { '' }
 			os.write_file(path, content) or { return 'Error: write failed' }
 			return 'Done'
 		}
 		'run_command' {
+			if restrict_workspace {
+				cmd := args['command'] or { '' }
+				// 检查命令是否包含 cd 或其他目录切换命令
+				if cmd.contains('cd ') || cmd.starts_with('cd ') {
+					return 'Error: 安全限制：不允许使用 cd 命令切换目录'
+				}
+				// 检查命令是否尝试访问工作区外路径
+				allowed_patterns := ['git', 'npm', 'pnpm', 'node', 'python', 'make', 'go ', 'cargo', 'curl', 'wget']
+				mut is_safe := false
+				for pattern in allowed_patterns {
+					if cmd.starts_with(pattern) || cmd.contains(' ${pattern}') {
+						is_safe = true
+						break
+					}
+				}
+				if !is_safe && (cmd.contains('/') || cmd.contains('..')) {
+					return 'Error: 安全限制：不允许访问工作区外的路径'
+				}
+				res := os.execute(cmd)
+				return json.encode(CommandResult{
+					exit_code: res.exit_code
+					stdout:    res.output
+					stderr:    ''
+				})
+			}
 			cmd := args['command'] or { '' }
 			res := os.execute(cmd)
 			return json.encode(CommandResult{
@@ -630,6 +726,16 @@ pub fn (mut a QwenAgent) execute_tool(name string, args map[string]string) strin
 			})
 		}
 		'glob' {
+			if restrict_workspace {
+				pattern := args['pattern'] or { '' }
+				// 验证 glob 模式在工作区内
+				if pattern.contains('..') || (!pattern.starts_with('.') && !pattern.starts_with('/')) {
+					// 相对模式，基于工作区
+					full_pattern := normalize_path(workspace_path + '/' + pattern)
+					return glob_files(full_pattern).join('\n')
+				}
+				return glob_files(pattern).join('\n')
+			}
 			pattern := args['pattern'] or { '' }
 			return glob_files(pattern).join('\n')
 		}

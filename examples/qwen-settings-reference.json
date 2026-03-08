@@ -7,6 +7,7 @@
       "selectedType": "qwen-oauth"
     }
   },
+  "restrictToWorkspace": true,
   "$version": 3,
   "mcpServers": {
     "bun": {
