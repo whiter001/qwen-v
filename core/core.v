@@ -107,6 +107,197 @@ pub:
 	stderr    string @[json: 'stderr']
 }
 
+// --- Subagent 结构 ---
+
+pub struct SubagentTask {
+pub mut:
+	id           string
+	task         string
+	label        string
+	status       string // running, completed, failed, canceled
+	result       string
+	created      i64
+}
+
+pub struct SubagentManager {
+pub mut:
+	tasks        map[string]&SubagentTask
+	next_id      int
+	workspace    string
+	settings     QwenSettings
+	creds        QwenCredentials
+	endpoint     string
+	model        string
+}
+
+pub fn new_subagent_manager(workspace string, settings QwenSettings, creds QwenCredentials) &SubagentManager {
+	return &SubagentManager{
+		tasks:     map[string]&SubagentTask{}
+		next_id:   1
+		workspace: workspace
+		settings:  settings
+		creds:     creds
+		endpoint:  get_endpoint(creds)
+		model:     'coder-model'
+	}
+}
+
+fn get_endpoint(creds QwenCredentials) string {
+	mut base_url := if creds.resource_url != '' { creds.resource_url } else { 'dashscope.aliyuncs.com/compatible-mode' }
+	if !base_url.starts_with('http') { base_url = 'https://' + base_url }
+	if !base_url.ends_with('/v1') { base_url = base_url.trim_right('/') + '/v1' }
+	return base_url + '/chat/completions'
+}
+
+// 运行子 agent 任务
+pub fn (mut sm SubagentManager) run_subagent(task string, label string) string {
+	task_id := 'subagent-${sm.next_id}'
+	sm.next_id++
+
+	mut sub_task := &SubagentTask{
+		id:      task_id
+		task:    task
+		label:   label
+		status:  'running'
+		created: time.now().unix()
+	}
+	sm.tasks[task_id] = sub_task
+
+	// 构建子 agent 的 system prompt
+	system_prompt := 'You are a subagent. Complete the given task independently and provide a clear, concise result.'
+
+	// 构建消息
+	mut messages := [
+		ChatMessage{
+			role:    'system'
+			content: system_prompt
+		},
+		ChatMessage{
+			role:    'user'
+			content: task
+		},
+	]
+
+	// 调用 LLM 执行任务（同步执行）
+	sm.execute_with_tools(mut messages, mut sub_task)
+
+	display_label := if label != '' { label } else { task_id }
+	return 'Subagent ${display_label} completed: ${sub_task.result}'
+}
+
+fn (mut sm SubagentManager) execute_with_tools(mut messages []ChatMessage, mut task SubagentTask) {
+	// 获取可用工具
+	tools := get_available_tools()
+
+	for iter := 0; iter < 10; iter++ {
+		// 发送请求
+		req_body := ChatRequest{
+			model:    sm.model
+			messages: messages
+			stream:   false
+			tools:    tools
+		}
+
+		req_json := json.encode(req_body)
+		mut req := http.new_request(.post, sm.endpoint, req_json)
+		req.add_header(.authorization, 'Bearer ' + sm.creds.access_token)
+		req.add_header(.content_type, 'application/json')
+
+		resp := req.do() or {
+			task.status = 'failed'
+			task.result = 'Error: ${err}'
+			return
+		}
+
+		if resp.status_code != 200 {
+			task.status = 'failed'
+			task.result = 'Error: API returned ${resp.status_code}'
+			return
+		}
+
+		chat_resp := json.decode(ChatResponse, resp.body) or {
+			task.status = 'failed'
+			task.result = 'Error: Failed to parse response'
+			return
+		}
+
+		if chat_resp.choices.len == 0 {
+			task.status = 'completed'
+			task.result = 'No response from subagent'
+			return
+		}
+
+		mut msg := chat_resp.choices[0].message
+		messages << msg
+
+		// 检查是否有工具调用
+		if tcs := msg.tool_calls {
+			if tcs.len > 0 {
+				for tool_call in tcs {
+					tname := tool_call.function.name
+					args := json.decode(map[string]string, tool_call.function.arguments) or { map[string]string{} }
+
+					// 执行工具
+					result := sm.execute_tool(tname, args)
+					messages << ChatMessage{
+						role:         'tool'
+						tool_call_id: tool_call.id
+						content:      result
+					}
+				}
+				continue // 继续循环
+			}
+		}
+
+		// 没有工具调用，返回结果
+		task.status = 'completed'
+		if content := msg.content {
+			task.result = content
+		}
+		return
+	}
+
+	task.status = 'failed'
+	task.result = 'Max iterations reached'
+}
+
+fn (sm SubagentManager) execute_tool(name string, args map[string]string) string {
+	match name {
+		'list_directory' {
+			path := normalize_path(args['path'] or { '.' })
+			items := os.ls(path) or { return 'Error: ${err}' }
+			return items.join('\n')
+		}
+		'read_file' {
+			path := normalize_path(args['path'] or { '' })
+			content := os.read_file(path) or { return 'Error: ${err}' }
+			return truncate_tool_output(content, 16384, 512)
+		}
+		'write_file' {
+			path := normalize_path(args['path'] or { '' })
+			content := args['content'] or { '' }
+			os.write_file(path, content) or { return 'Error: ${err}' }
+			return 'Done'
+		}
+		'run_command' {
+			cmd := args['command'] or { '' }
+			res := os.execute(cmd)
+			return json.encode(CommandResult{
+				exit_code: res.exit_code
+				stdout:    res.output
+				stderr:    ''
+			})
+		}
+		'glob' {
+			pattern := args['pattern'] or { '' }
+			return glob_files(pattern).join('\n')
+		}
+		else {
+			return 'Tool ${name} not implemented'
+		}
+	}
+}
+
 // --- 工具实现：辅助函数 ---
 
 pub fn normalize_path(path string) string {
@@ -491,22 +682,37 @@ pub fn get_available_tools() []Tool {
 					required:   ['code']
 				}
 			}
+		},
+		Tool{
+			function: FunctionDeclaration{
+				name:        'subagent'
+				description: '派生子 agent 独立执行复杂任务。子 agent 会在后台运行并返回结果。'
+				parameters:  Schema{
+					type_:      'object'
+					properties: {
+						'task':  Property{'string', '要分配给子 agent 的任务描述'}
+						'label': Property{'string', '可选的任务标签'}
+					}
+					required:   ['task']
+				}
+			}
 		}
 	]
 }
 
 pub struct QwenAgent {
 pub mut:
-	creds        QwenCredentials
-	endpoint     string
-	model        string
-	history      []ChatMessage
-	mcp_clients  map[string]&McpClient
-	extra_tools  []Tool
-	settings     QwenSettings
-	debug        bool
-	status_text  string
-	is_plan_mode bool
+	creds           QwenCredentials
+	endpoint        string
+	model           string
+	history         []ChatMessage
+	mcp_clients     map[string]&McpClient
+	extra_tools     []Tool
+	settings        QwenSettings
+	debug           bool
+	status_text     string
+	is_plan_mode    bool
+	subagent_manager &SubagentManager
 }
 
 pub fn new_qwen_agent() !&QwenAgent {
@@ -526,8 +732,9 @@ pub fn new_qwen_agent() !&QwenAgent {
 		extra_tools: []Tool{}
 		settings: settings
 		debug: false
+		subagent_manager: new_subagent_manager(os.getwd(), settings, creds)
 	}
-	
+
 	agent.init_mcp_tools()
 	return agent
 }
@@ -650,6 +857,14 @@ pub fn (mut a QwenAgent) execute_tool(name string, args map[string]string) strin
 				mcp_tool_name = 'browser_' + mcp_tool_name
 			}
 			return client.call_tool(mcp_tool_name, args) or { 'Error: MCP call failed: ${err}' }
+		}
+		'subagent' {
+			if a.subagent_manager == unsafe { nil } {
+				return 'Error: Subagent manager not initialized'
+			}
+			task := args['task'] or { return 'Error: task is required' }
+			label := args['label'] or { '' }
+			return a.subagent_manager.run_subagent(task, label)
 		}
 		else {
 			return 'Tool ${name} not implemented yet'
