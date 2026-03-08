@@ -185,6 +185,65 @@ pub fn (mut sm SubagentManager) run_subagent(task string, label string) string {
 	return 'Subagent ${display_label} completed: ${sub_task.result}'
 }
 
+// 在后台派生子 agent（异步执行）
+pub fn (mut sm SubagentManager) spawn_subagent(task string, label string) string {
+	task_id := 'spawn-${sm.next_id}'
+	sm.next_id++
+
+	mut sub_task := &SubagentTask{
+		id:      task_id
+		task:    task
+		label:   label
+		status:  'pending'
+		created: time.now().unix()
+	}
+	sm.tasks[task_id] = sub_task
+
+	// 在后台线程中执行
+	spawn sm.run_background_task(task_id, task)
+
+	display_label := if label != '' { label } else { task_id }
+	return 'Spawned background task ${display_label} (ID: ${task_id}). Use spawn_wait to get result.'
+}
+
+// 后台运行任务
+fn (mut sm SubagentManager) run_background_task(task_id string, task string) {
+	mut sub_task := sm.tasks[task_id] or { return }
+	sub_task.status = 'running'
+
+	// 构建消息
+	mut messages := [
+		ChatMessage{
+			role:    'system'
+			content: 'You are a subagent. Complete the given task independently and provide a clear, concise result.'
+		},
+		ChatMessage{
+			role:    'user'
+			content: task
+		},
+	]
+
+	sm.execute_with_tools(mut messages, mut sub_task)
+}
+
+// 等待后台任务完成
+pub fn (mut sm SubagentManager) wait_spawn(id string) string {
+	for {
+		if task := sm.tasks[id] {
+			if task.status == 'completed' || task.status == 'failed' {
+				return 'Task ${id} ${task.status}: ${task.result}'
+			}
+			if task.status == 'pending' {
+				return 'Task ${id} is still starting...'
+			}
+		} else {
+			return 'Error: Task ${id} not found'
+		}
+		time.sleep(500 * time.millisecond)
+	}
+	return ''
+}
+
 fn (mut sm SubagentManager) execute_with_tools(mut messages []ChatMessage, mut task SubagentTask) {
 	// 获取可用工具
 	tools := get_available_tools()
@@ -686,7 +745,7 @@ pub fn get_available_tools() []Tool {
 		Tool{
 			function: FunctionDeclaration{
 				name:        'subagent'
-				description: '派生子 agent 独立执行复杂任务。子 agent 会在后台运行并返回结果。'
+				description: '派生子 agent 同步执行复杂任务，等待完成后返回结果。'
 				parameters:  Schema{
 					type_:      'object'
 					properties: {
@@ -694,6 +753,33 @@ pub fn get_available_tools() []Tool {
 						'label': Property{'string', '可选的任务标签'}
 					}
 					required:   ['task']
+				}
+			}
+		},
+		Tool{
+			function: FunctionDeclaration{
+				name:        'spawn'
+				description: '在后台派生子 agent 异步执行任务，立即返回任务 ID，主 agent 可以继续执行其他任务。'
+				parameters:  Schema{
+					type_:      'object'
+					properties: {
+						'task':  Property{'string', '要分配给子 agent 的任务描述'}
+						'label': Property{'string', '可选的任务标签'}
+					}
+					required:   ['task']
+				}
+			}
+		},
+		Tool{
+			function: FunctionDeclaration{
+				name:        'spawn_wait'
+				description: '等待指定 ID 的后台子 agent 任务完成并返回结果。'
+				parameters:  Schema{
+					type_:      'object'
+					properties: {
+						'id': Property{'string', '子 agent 任务 ID'}
+					}
+					required:   ['id']
 				}
 			}
 		}
@@ -865,6 +951,21 @@ pub fn (mut a QwenAgent) execute_tool(name string, args map[string]string) strin
 			task := args['task'] or { return 'Error: task is required' }
 			label := args['label'] or { '' }
 			return a.subagent_manager.run_subagent(task, label)
+		}
+		'spawn' {
+			if a.subagent_manager == unsafe { nil } {
+				return 'Error: Subagent manager not initialized'
+			}
+			task := args['task'] or { return 'Error: task is required' }
+			label := args['label'] or { '' }
+			return a.subagent_manager.spawn_subagent(task, label)
+		}
+		'spawn_wait' {
+			if a.subagent_manager == unsafe { nil } {
+				return 'Error: Subagent manager not initialized'
+			}
+			id := args['id'] or { return 'Error: id is required' }
+			return a.subagent_manager.wait_spawn(id)
 		}
 		else {
 			return 'Tool ${name} not implemented yet'
